@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -10,10 +10,10 @@
 // UpdateQueue is a linked list of prioritized updates.
 //
 // Like fibers, update queues come in pairs: a current queue, which represents
-// the visible state of the screen, and a work-in-progress queue, which is
-// can be mutated and processed asynchronously before it is committed — a form
-// of double buffering. If a work-in-progress render is discarded before
-// finishing, we create a new work-in-progress by cloning the current queue.
+// the visible state of the screen, and a work-in-progress queue, which can be
+// mutated and processed asynchronously before it is committed — a form of
+// double buffering. If a work-in-progress render is discarded before finishing,
+// we create a new work-in-progress by cloning the current queue.
 //
 // Both queues share a persistent, singly-linked list structure. To schedule an
 // update, we append it to the end of both queues. Each queue maintains a
@@ -89,11 +89,11 @@ import type {ExpirationTime} from './ReactFiberExpirationTime';
 
 import {NoWork} from './ReactFiberExpirationTime';
 import {
-  Callback,
-  ShouldCapture,
-  DidCapture,
-} from 'shared/ReactTypeOfSideEffect';
-import {ClassComponent} from 'shared/ReactTypeOfWork';
+  enterDisallowedContextReadInDEV,
+  exitDisallowedContextReadInDEV,
+} from './ReactFiberNewContext';
+import {Callback, ShouldCapture, DidCapture} from 'shared/ReactSideEffectTags';
+import {ClassComponent} from 'shared/ReactWorkTags';
 
 import {
   debugRenderPhaseSideEffects,
@@ -352,6 +352,7 @@ function getStateFromUpdate<State>(
       if (typeof payload === 'function') {
         // Updater function
         if (__DEV__) {
+          enterDisallowedContextReadInDEV();
           if (
             debugRenderPhaseSideEffects ||
             (debugRenderPhaseSideEffectsForStrictMode &&
@@ -360,7 +361,11 @@ function getStateFromUpdate<State>(
             payload.call(instance, prevState, nextProps);
           }
         }
-        return payload.call(instance, prevState, nextProps);
+        const nextState = payload.call(instance, prevState, nextProps);
+        if (__DEV__) {
+          exitDisallowedContextReadInDEV();
+        }
+        return nextState;
       }
       // State object
       return payload;
@@ -376,6 +381,7 @@ function getStateFromUpdate<State>(
       if (typeof payload === 'function') {
         // Updater function
         if (__DEV__) {
+          enterDisallowedContextReadInDEV();
           if (
             debugRenderPhaseSideEffects ||
             (debugRenderPhaseSideEffectsForStrictMode &&
@@ -385,6 +391,9 @@ function getStateFromUpdate<State>(
           }
         }
         partialState = payload.call(instance, prevState, nextProps);
+        if (__DEV__) {
+          exitDisallowedContextReadInDEV();
+        }
       } else {
         // Partial state object
         partialState = payload;
@@ -429,7 +438,7 @@ export function processUpdateQueue<State>(
   let resultState = newBaseState;
   while (update !== null) {
     const updateExpirationTime = update.expirationTime;
-    if (updateExpirationTime > renderExpirationTime) {
+    if (updateExpirationTime < renderExpirationTime) {
       // This update does not have sufficient priority. Skip it.
       if (newFirstUpdate === null) {
         // This is the first skipped update. It will be the first update in
@@ -441,10 +450,7 @@ export function processUpdateQueue<State>(
       }
       // Since this update will remain in the list, update the remaining
       // expiration time.
-      if (
-        newExpirationTime === NoWork ||
-        newExpirationTime > updateExpirationTime
-      ) {
+      if (newExpirationTime < updateExpirationTime) {
         newExpirationTime = updateExpirationTime;
       }
     } else {
@@ -480,7 +486,7 @@ export function processUpdateQueue<State>(
   update = queue.firstCapturedUpdate;
   while (update !== null) {
     const updateExpirationTime = update.expirationTime;
-    if (updateExpirationTime > renderExpirationTime) {
+    if (updateExpirationTime < renderExpirationTime) {
       // This update does not have sufficient priority. Skip it.
       if (newFirstCapturedUpdate === null) {
         // This is the first skipped captured update. It will be the first
@@ -494,10 +500,7 @@ export function processUpdateQueue<State>(
       }
       // Since this update will remain in the list, update the remaining
       // expiration time.
-      if (
-        newExpirationTime === NoWork ||
-        newExpirationTime > updateExpirationTime
-      ) {
+      if (newExpirationTime < updateExpirationTime) {
         newExpirationTime = updateExpirationTime;
       }
     } else {
@@ -599,19 +602,17 @@ export function commitUpdateQueue<State>(
   }
 
   // Commit the effects
-  let effect = finishedQueue.firstEffect;
+  commitUpdateEffects(finishedQueue.firstEffect, instance);
   finishedQueue.firstEffect = finishedQueue.lastEffect = null;
-  while (effect !== null) {
-    const callback = effect.callback;
-    if (callback !== null) {
-      effect.callback = null;
-      callCallback(callback, instance);
-    }
-    effect = effect.nextEffect;
-  }
 
-  effect = finishedQueue.firstCapturedEffect;
+  commitUpdateEffects(finishedQueue.firstCapturedEffect, instance);
   finishedQueue.firstCapturedEffect = finishedQueue.lastCapturedEffect = null;
+}
+
+function commitUpdateEffects<State>(
+  effect: Update<State> | null,
+  instance: any,
+): void {
   while (effect !== null) {
     const callback = effect.callback;
     if (callback !== null) {

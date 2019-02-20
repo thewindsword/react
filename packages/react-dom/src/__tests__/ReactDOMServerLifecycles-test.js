@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -201,8 +201,10 @@ describe('ReactDOMServerLifecycles', () => {
     }
 
     expect(() => ReactDOMServer.renderToString(<Component />)).toWarnDev(
-      'Component: Did not properly initialize state during construction. ' +
-        'Expected state to be an object, but it was undefined.',
+      '`Component` uses `getDerivedStateFromProps` but its initial state is ' +
+        'undefined. This is not recommended. Instead, define the initial state by ' +
+        'assigning an object to `this.state` in the constructor of `Component`. ' +
+        'This ensures that `getDerivedStateFromProps` arguments have a consistent shape.',
       {withoutStack: true},
     );
 

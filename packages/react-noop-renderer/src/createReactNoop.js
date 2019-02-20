@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -18,18 +18,30 @@ import type {Fiber} from 'react-reconciler/src/ReactFiber';
 import type {UpdateQueue} from 'react-reconciler/src/ReactUpdateQueue';
 import type {ReactNodeList} from 'shared/ReactTypes';
 
-import * as ReactPortal from 'shared/ReactPortal';
+import {createPortal} from 'shared/ReactPortal';
 import expect from 'expect';
+import {REACT_FRAGMENT_TYPE, REACT_ELEMENT_TYPE} from 'shared/ReactSymbols';
+import warningWithoutStack from 'shared/warningWithoutStack';
 
-type Container = {rootID: string, children: Array<Instance | TextInstance>};
-type Props = {prop: any, hidden?: boolean, children?: mixed};
+// for .act's return value
+type Thenable = {
+  then(resolve: () => mixed, reject?: () => mixed): mixed,
+};
+
+type Container = {
+  rootID: string,
+  children: Array<Instance | TextInstance>,
+};
+type Props = {prop: any, hidden: boolean, children?: mixed};
 type Instance = {|
   type: string,
   id: number,
   children: Array<Instance | TextInstance>,
+  text: string | null,
   prop: any,
+  hidden: boolean,
 |};
-type TextInstance = {|text: string, id: number|};
+type TextInstance = {|text: string, id: number, hidden: boolean|};
 
 const NO_CONTEXT = {};
 const UPDATE_SIGNAL = {};
@@ -40,7 +52,12 @@ if (__DEV__) {
 
 function createReactNoop(reconciler: Function, useMutation: boolean) {
   let scheduledCallback = null;
+  let scheduledCallbackTimeout = -1;
+  let scheduledPassiveCallback = null;
   let instanceCounter = 0;
+  let hostDiffCounter = 0;
+  let hostUpdateCounter = 0;
+  let hostCloneCounter = 0;
 
   function appendChildToContainerOrInstance(
     parentInstance: Container | Instance,
@@ -160,6 +177,47 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
     removeChildFromContainerOrInstance(parentInstance, child);
   }
 
+  function cloneInstance(
+    instance: Instance,
+    updatePayload: null | Object,
+    type: string,
+    oldProps: Props,
+    newProps: Props,
+    internalInstanceHandle: Object,
+    keepChildren: boolean,
+    recyclableInstance: null | Instance,
+  ): Instance {
+    const clone = {
+      id: instance.id,
+      type: type,
+      children: keepChildren ? instance.children : [],
+      text: shouldSetTextContent(type, newProps)
+        ? (newProps.children: any) + ''
+        : null,
+      prop: newProps.prop,
+      hidden: newProps.hidden === true,
+    };
+    Object.defineProperty(clone, 'id', {
+      value: clone.id,
+      enumerable: false,
+    });
+    Object.defineProperty(clone, 'text', {
+      value: clone.text,
+      enumerable: false,
+    });
+    hostCloneCounter++;
+    return clone;
+  }
+
+  function shouldSetTextContent(type: string, props: Props): boolean {
+    if (type === 'errorInBeginPhase') {
+      throw new Error('Error in host config.');
+    }
+    return (
+      typeof props.children === 'string' || typeof props.children === 'number'
+    );
+  }
+
   let elapsedTimeInMs = 0;
 
   const sharedHostConfig = {
@@ -183,10 +241,18 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
         id: instanceCounter++,
         type: type,
         children: [],
+        text: shouldSetTextContent(type, props)
+          ? (props.children: any) + ''
+          : null,
         prop: props.prop,
+        hidden: props.hidden === true,
       };
       // Hide from unit tests
       Object.defineProperty(inst, 'id', {value: inst.id, enumerable: false});
+      Object.defineProperty(inst, 'text', {
+        value: inst.text,
+        enumerable: false,
+      });
       return inst;
     },
 
@@ -220,17 +286,11 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       if (newProps === null) {
         throw new Error('Should have new props');
       }
+      hostDiffCounter++;
       return UPDATE_SIGNAL;
     },
 
-    shouldSetTextContent(type: string, props: Props): boolean {
-      if (type === 'errorInBeginPhase') {
-        throw new Error('Error in host config.');
-      }
-      return (
-        typeof props.children === 'string' || typeof props.children === 'number'
-      );
-    },
+    shouldSetTextContent,
 
     shouldDeprioritizeSubtree(type: string, props: Props): boolean {
       return !!props.hidden;
@@ -242,13 +302,13 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       hostContext: Object,
       internalInstanceHandle: Object,
     ): TextInstance {
-      const inst = {text: text, id: instanceCounter++};
+      const inst = {text: text, id: instanceCounter++, hidden: false};
       // Hide from unit tests
       Object.defineProperty(inst, 'id', {value: inst.id, enumerable: false});
       return inst;
     },
 
-    scheduleDeferredCallback(callback) {
+    scheduleDeferredCallback(callback, options) {
       if (scheduledCallback) {
         throw new Error(
           'Scheduling a callback twice is excessive. Instead, keep track of ' +
@@ -256,6 +316,19 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
         );
       }
       scheduledCallback = callback;
+      if (
+        typeof options === 'object' &&
+        options !== null &&
+        typeof options.timeout === 'number'
+      ) {
+        const newTimeout = options.timeout;
+        if (
+          scheduledCallbackTimeout === -1 ||
+          scheduledCallbackTimeout > newTimeout
+        ) {
+          scheduledCallbackTimeout = elapsedTimeInMs + newTimeout;
+        }
+      }
       return 0;
     },
 
@@ -264,11 +337,29 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
         throw new Error('No callback is scheduled.');
       }
       scheduledCallback = null;
+      scheduledCallbackTimeout = -1;
     },
+
+    shouldYield,
 
     scheduleTimeout: setTimeout,
     cancelTimeout: clearTimeout,
     noTimeout: -1,
+    schedulePassiveEffects(callback) {
+      if (scheduledCallback) {
+        throw new Error(
+          'Scheduling a callback twice is excessive. Instead, keep track of ' +
+            'whether the callback has already been scheduled.',
+        );
+      }
+      scheduledPassiveCallback = callback;
+    },
+    cancelPassiveEffects() {
+      if (scheduledPassiveCallback === null) {
+        throw new Error('No passive effects callback is scheduled.');
+      }
+      scheduledPassiveCallback = null;
+    },
 
     prepareForCommit(): void {},
 
@@ -303,7 +394,12 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
           if (oldProps === null) {
             throw new Error('Should have old props');
           }
+          hostUpdateCounter++;
           instance.prop = newProps.prop;
+          instance.hidden = newProps.hidden === true;
+          if (shouldSetTextContent(type, newProps)) {
+            instance.text = (newProps.children: any) + '';
+          }
         },
 
         commitTextUpdate(
@@ -311,6 +407,7 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
           oldText: string,
           newText: string,
         ): void {
+          hostUpdateCounter++;
           textInstance.text = newText;
         },
 
@@ -321,35 +418,34 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
         removeChild,
         removeChildFromContainer,
 
-        resetTextContent(instance: Instance): void {},
+        hideInstance(instance: Instance): void {
+          instance.hidden = true;
+        },
+
+        hideTextInstance(textInstance: TextInstance): void {
+          textInstance.hidden = true;
+        },
+
+        unhideInstance(instance: Instance, props: Props): void {
+          if (!props.hidden) {
+            instance.hidden = false;
+          }
+        },
+
+        unhideTextInstance(textInstance: TextInstance, text: string): void {
+          textInstance.hidden = false;
+        },
+
+        resetTextContent(instance: Instance): void {
+          instance.text = null;
+        },
       }
     : {
         ...sharedHostConfig,
         supportsMutation: false,
         supportsPersistence: true,
 
-        cloneInstance(
-          instance: Instance,
-          updatePayload: null | Object,
-          type: string,
-          oldProps: Props,
-          newProps: Props,
-          internalInstanceHandle: Object,
-          keepChildren: boolean,
-          recyclableInstance: null | Instance,
-        ): Instance {
-          const clone = {
-            id: instance.id,
-            type: type,
-            children: keepChildren ? instance.children : [],
-            prop: newProps.prop,
-          };
-          Object.defineProperty(clone, 'id', {
-            value: clone.id,
-            enumerable: false,
-          });
-          return clone;
-        },
+        cloneInstance,
 
         createContainerChildSet(
           container: Container,
@@ -375,6 +471,61 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
         ): void {
           container.children = newChildren;
         },
+
+        cloneHiddenInstance(
+          instance: Instance,
+          type: string,
+          props: Props,
+          internalInstanceHandle: Object,
+        ): Instance {
+          const clone = cloneInstance(
+            instance,
+            null,
+            type,
+            props,
+            props,
+            internalInstanceHandle,
+            true,
+            null,
+          );
+          clone.hidden = true;
+          return clone;
+        },
+
+        cloneUnhiddenInstance(
+          instance: Instance,
+          type: string,
+          props: Props,
+          internalInstanceHandle: Object,
+        ): Instance {
+          const clone = cloneInstance(
+            instance,
+            null,
+            type,
+            props,
+            props,
+            internalInstanceHandle,
+            true,
+            null,
+          );
+          clone.hidden = props.hidden;
+          return clone;
+        },
+
+        createHiddenTextInstance(
+          text: string,
+          rootContainerInstance: Container,
+          hostContext: Object,
+          internalInstanceHandle: Object,
+        ): TextInstance {
+          const inst = {text: text, id: instanceCounter++, hidden: true};
+          // Hide from unit tests
+          Object.defineProperty(inst, 'id', {
+            value: inst.id,
+            enumerable: false,
+          });
+          return inst;
+        },
       };
 
   const NoopRenderer = reconciler(hostConfig);
@@ -385,37 +536,98 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
 
   let yieldedValues = null;
 
+  let didYield;
   let unitsRemaining;
 
-  function* flushUnitsOfWork(n: number): Generator<Array<mixed>, void, void> {
-    let didStop = false;
-    while (!didStop && scheduledCallback !== null) {
-      let cb = scheduledCallback;
-      scheduledCallback = null;
-      unitsRemaining = n;
-      cb({
-        timeRemaining() {
-          if (yieldedValues !== null) {
-            return 0;
-          }
-          if (unitsRemaining-- > 0) {
-            return 999;
-          }
-          didStop = true;
-          return 0;
-        },
-        // React's scheduler has its own way of keeping track of expired
-        // work and doesn't read this, so don't bother setting it to the
-        // correct value.
-        didTimeout: false,
-      });
-
-      if (yieldedValues !== null) {
-        const values = yieldedValues;
-        yieldedValues = null;
-        yield values;
+  function shouldYield() {
+    if (
+      scheduledCallbackTimeout === -1 ||
+      elapsedTimeInMs > scheduledCallbackTimeout
+    ) {
+      return false;
+    } else {
+      if (didYield || yieldedValues !== null) {
+        return true;
       }
+      if (unitsRemaining-- > 0) {
+        return false;
+      }
+      didYield = true;
+      return true;
     }
+  }
+
+  function* flushUnitsOfWork(n: number): Generator<Array<mixed>, void, void> {
+    unitsRemaining = n + 1;
+    didYield = false;
+    try {
+      while (!didYield && scheduledCallback !== null) {
+        let cb = scheduledCallback;
+        scheduledCallback = null;
+        cb();
+        if (yieldedValues !== null) {
+          const values = yieldedValues;
+          yieldedValues = null;
+          yield values;
+        }
+      }
+    } finally {
+      unitsRemaining = -1;
+      didYield = false;
+    }
+  }
+
+  function childToJSX(child, text) {
+    if (text !== null) {
+      return text;
+    }
+    if (child === null) {
+      return null;
+    }
+    if (typeof child === 'string') {
+      return child;
+    }
+    if (Array.isArray(child)) {
+      if (child.length === 0) {
+        return null;
+      }
+      if (child.length === 1) {
+        return childToJSX(child[0], null);
+      }
+      // $FlowFixMe
+      const children = child.map(c => childToJSX(c, null));
+      if (children.every(c => typeof c === 'string' || typeof c === 'number')) {
+        return children.join('');
+      }
+      return children;
+    }
+    if (Array.isArray(child.children)) {
+      // This is an instance.
+      const instance: Instance = (child: any);
+      const children = childToJSX(instance.children, instance.text);
+      const props = ({prop: instance.prop}: any);
+      if (instance.hidden) {
+        props.hidden = true;
+      }
+      if (children !== null) {
+        props.children = children;
+      }
+      return {
+        $$typeof: REACT_ELEMENT_TYPE,
+        type: instance.type,
+        key: null,
+        ref: null,
+        props: props,
+        _owner: null,
+        _store: __DEV__ ? {} : undefined,
+      };
+    }
+    // This is a text instance
+    const textInstance: TextInstance = (child: any);
+    if (textInstance.hidden) {
+      return '';
+    }
+    return textInstance.text;
   }
 
   const ReactNoop = {
@@ -430,16 +642,35 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
 
     getOrCreateRootContainer(
       rootID: string = DEFAULT_ROOT_ID,
-      isAsync: boolean = false,
+      isConcurrent: boolean = false,
     ) {
       let root = roots.get(rootID);
       if (!root) {
         const container = {rootID: rootID, children: []};
         rootContainers.set(rootID, container);
-        root = NoopRenderer.createContainer(container, isAsync, false);
+        root = NoopRenderer.createContainer(container, isConcurrent, false);
         roots.set(rootID, root);
       }
       return root.current.stateNode.containerInfo;
+    },
+
+    getChildrenAsJSX(rootID: string = DEFAULT_ROOT_ID) {
+      const children = childToJSX(ReactNoop.getChildren(rootID), null);
+      if (children === null) {
+        return null;
+      }
+      if (Array.isArray(children)) {
+        return {
+          $$typeof: REACT_ELEMENT_TYPE,
+          type: REACT_FRAGMENT_TYPE,
+          key: null,
+          ref: null,
+          props: {children},
+          _owner: null,
+          _store: __DEV__ ? {} : undefined,
+        };
+      }
+      return children;
     },
 
     createPortal(
@@ -447,7 +678,7 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       container: Container,
       key: ?string = null,
     ) {
-      return ReactPortal.createPortal(children, container, null, key);
+      return createPortal(children, container, null, key);
     },
 
     // Shortcut for testing a single root
@@ -457,8 +688,11 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
 
     renderLegacySyncRoot(element: React$Element<any>, callback: ?Function) {
       const rootID = DEFAULT_ROOT_ID;
-      const isAsync = false;
-      const container = ReactNoop.getOrCreateRootContainer(rootID, isAsync);
+      const isConcurrent = false;
+      const container = ReactNoop.getOrCreateRootContainer(
+        rootID,
+        isConcurrent,
+      );
       const root = roots.get(container.rootID);
       NoopRenderer.updateContainer(element, root, null, callback);
     },
@@ -468,8 +702,11 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       rootID: string,
       callback: ?Function,
     ) {
-      const isAsync = true;
-      const container = ReactNoop.getOrCreateRootContainer(rootID, isAsync);
+      const isConcurrent = true;
+      const container = ReactNoop.getOrCreateRootContainer(
+        rootID,
+        isConcurrent,
+      );
       const root = roots.get(container.rootID);
       NoopRenderer.updateContainer(element, root, null, callback);
     },
@@ -494,6 +731,12 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       const component = (componentOrElement: any);
       if (typeof component.id === 'number') {
         return component;
+      }
+      if (__DEV__) {
+        return NoopRenderer.findHostInstanceWithWarning(
+          component,
+          'findInstance',
+        );
       }
       return NoopRenderer.findHostInstance(component);
     },
@@ -556,6 +799,38 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       return actual !== null ? actual : [];
     },
 
+    flushWithHostCounters(
+      fn: () => void,
+    ):
+      | {|
+          hostDiffCounter: number,
+          hostUpdateCounter: number,
+        |}
+      | {|
+          hostDiffCounter: number,
+          hostCloneCounter: number,
+        |} {
+      hostDiffCounter = 0;
+      hostUpdateCounter = 0;
+      hostCloneCounter = 0;
+      try {
+        ReactNoop.flush();
+        return useMutation
+          ? {
+              hostDiffCounter,
+              hostUpdateCounter,
+            }
+          : {
+              hostDiffCounter,
+              hostCloneCounter,
+            };
+      } finally {
+        hostDiffCounter = 0;
+        hostUpdateCounter = 0;
+        hostCloneCounter = 0;
+      }
+    },
+
     expire(ms: number): Array<mixed> {
       ReactNoop.advanceTime(ms);
       return ReactNoop.flushExpired();
@@ -595,10 +870,57 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
 
     interactiveUpdates: NoopRenderer.interactiveUpdates,
 
+    // maybe this should exist only in the test file
+    act(callback: () => void): Thenable {
+      // note: keep these warning messages in sync with
+      // ReactTestRenderer.js and ReactTestUtils.js
+      let result = NoopRenderer.batchedUpdates(callback);
+      if (__DEV__) {
+        if (result !== undefined) {
+          let addendum;
+          if (result !== null && typeof result.then === 'function') {
+            addendum =
+              "\n\nIt looks like you wrote ReactNoop.act(async () => ...) or returned a Promise from it's callback. " +
+              'Putting asynchronous logic inside ReactNoop.act(...) is not supported.\n';
+          } else {
+            addendum = ' You returned: ' + result;
+          }
+          warningWithoutStack(
+            false,
+            'The callback passed to ReactNoop.act(...) function must not return anything.%s',
+            addendum,
+          );
+        }
+      }
+      ReactNoop.flushPassiveEffects();
+      // we want the user to not expect a return,
+      // but we want to warn if they use it like they can await on it.
+      return {
+        then() {
+          if (__DEV__) {
+            warningWithoutStack(
+              false,
+              'Do not await the result of calling ReactNoop.act(...), it is not a Promise.',
+            );
+          }
+        },
+      };
+    },
+
     flushSync(fn: () => mixed) {
       yieldedValues = [];
       NoopRenderer.flushSync(fn);
       return yieldedValues;
+    },
+
+    flushPassiveEffects() {
+      // Trick to flush passive effects without exposing an internal API:
+      // Create a throwaway root and schedule a dummy update on it.
+      const rootID = 'bloopandthenmoreletterstoavoidaconflict';
+      const container = {rootID: rootID, children: []};
+      rootContainers.set(rootID, container);
+      const root = NoopRenderer.createContainer(container, true, false);
+      NoopRenderer.updateContainer(null, root, null, null);
     },
 
     // Logs the current state of the tree.
@@ -703,9 +1025,10 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       rootID: string = DEFAULT_ROOT_ID,
     ) {
       const root: any = roots.get(rootID);
+      const expiration = NoopRenderer.computeUniqueAsyncExpiration();
       const batch = {
         _defer: true,
-        _expirationTime: 1,
+        _expirationTime: expiration,
         _onComplete: () => {
           root.firstBatch = null;
         },
@@ -716,7 +1039,7 @@ function createReactNoop(reconciler: Function, useMutation: boolean) {
       expect(actual).toEqual(expectedFlush);
       return (expectedCommit: Array<mixed>) => {
         batch._defer = false;
-        NoopRenderer.flushRoot(root, 1);
+        NoopRenderer.flushRoot(root, expiration);
         expect(yieldedValues).toEqual(expectedCommit);
       };
     },

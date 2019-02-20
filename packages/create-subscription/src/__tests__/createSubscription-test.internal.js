@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -148,7 +148,7 @@ describe('createSubscription', () => {
 
       // Test a promise that resolves before render
       // Note that this will require an extra render anyway,
-      // Because there is no way to syncrhonously get a Promise's value
+      // Because there is no way to synchronously get a Promise's value
       rejectB(false);
       ReactNoop.render(<Subscription source={promiseB}>{render}</Subscription>);
       expect(ReactNoop.flush()).toEqual(['loading']);
@@ -431,7 +431,7 @@ describe('createSubscription', () => {
       'Parent.componentDidUpdate',
     ]);
 
-    // Updates from the new subsribable should be ignored.
+    // Updates from the new subscribable should be ignored.
     observableB.next('b-1');
     expect(ReactNoop.flush()).toEqual([]);
     expect(log).toEqual([

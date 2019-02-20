@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -196,6 +196,27 @@ describe('ReactComponentLifeCycle', () => {
     expect(function() {
       instance = ReactTestUtils.renderIntoDocument(instance);
     }).not.toThrow();
+  });
+
+  it("warns if setting 'this.state = props'", () => {
+    class StatefulComponent extends React.Component {
+      constructor(props, context) {
+        super(props, context);
+        this.state = props;
+      }
+      render() {
+        return <div />;
+      }
+    }
+
+    expect(() => {
+      ReactTestUtils.renderIntoDocument(<StatefulComponent />);
+    }).toWarnDev(
+      'StatefulComponent: It is not recommended to assign props directly to state ' +
+        "because updates to props won't be reflected in state. " +
+        'In most cases, it is better to use props directly.',
+      {withoutStack: true},
+    );
   });
 
   it('should not allow update state inside of getInitialState', () => {
@@ -1003,8 +1024,10 @@ describe('ReactComponentLifeCycle', () => {
 
     const div = document.createElement('div');
     expect(() => ReactDOM.render(<MyComponent />, div)).toWarnDev(
-      'MyComponent: Did not properly initialize state during construction. ' +
-        'Expected state to be an object, but it was undefined.',
+      '`MyComponent` uses `getDerivedStateFromProps` but its initial state is ' +
+        'undefined. This is not recommended. Instead, define the initial state by ' +
+        'assigning an object to `this.state` in the constructor of `MyComponent`. ' +
+        'This ensures that `getDerivedStateFromProps` arguments have a consistent shape.',
       {withoutStack: true},
     );
 
@@ -1176,6 +1199,40 @@ describe('ReactComponentLifeCycle', () => {
 
     ReactDOM.render(<div />, div);
     expect(log).toEqual([]);
+  });
+
+  it('should pass previous state to shouldComponentUpdate even with getDerivedStateFromProps', () => {
+    const divRef = React.createRef();
+    class SimpleComponent extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = {
+          value: props.value,
+        };
+      }
+
+      static getDerivedStateFromProps(nextProps, prevState) {
+        if (nextProps.value === prevState.value) {
+          return null;
+        }
+        return {value: nextProps.value};
+      }
+
+      shouldComponentUpdate(nextProps, nextState) {
+        return nextState.value !== this.state.value;
+      }
+
+      render() {
+        return <div ref={divRef}>value: {this.state.value}</div>;
+      }
+    }
+
+    const div = document.createElement('div');
+
+    ReactDOM.render(<SimpleComponent value="initial" />, div);
+    expect(divRef.current.textContent).toBe('value: initial');
+    ReactDOM.render(<SimpleComponent value="updated" />, div);
+    expect(divRef.current.textContent).toBe('value: updated');
   });
 
   it('should call getSnapshotBeforeUpdate before mutations are committed', () => {
